@@ -99,11 +99,6 @@ Allow **camera** access when prompted. Focus the OpenCV window and press **Q** t
 
 ---
 
-## Credits
-
-- **Original project:** Hatice Sude Mutlu — [HaticeSude on GitHub](https://github.com/HaticeSude)
-- **Extensions:** unified gesture suite, MediaPipe Tasks migration, extra shortcuts and scrolling — maintained in this fork.
-
 ---
 
 ## Possible future work
