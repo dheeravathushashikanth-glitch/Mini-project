@@ -795,10 +795,7 @@ def draw_premium_dashboard(frame: np.ndarray, detected_hands: list[str]) -> None
     cv2.rectangle(overlay, (0, 0), (w, 50), (30, 30, 30), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     
-    # Text
-    cv2.putText(frame, "PRO AI GESTURE CENTER v2.0", (15, 32), cv2.FONT_HERSHEY_DUPLEX, 0.65, (0, 220, 255), 1, cv2.LINE_AA)
-    
-    # Hand indicators in top right
+    # Text indicators in top right
     right_on = "Right" in detected_hands
     left_on = "Left" in detected_hands
     
