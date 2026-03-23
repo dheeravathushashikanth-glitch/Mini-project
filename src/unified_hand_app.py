@@ -79,10 +79,10 @@ class AppConfig:
     SWIPE_DECAY: float = 0.85
     
     # Scrolling
-    SCROLL_STEP_ACCUM: int = 35
+    SCROLL_STEP_ACCUM: int = 20
     PINCH_SCROLL_ACCUM: int = 28
     HSCROLL_ACCUM: int = 40
-    MOBILE_SCROLL_DELTA_MIN: int = 15
+    MOBILE_SCROLL_DELTA_MIN: int = 8
     
     # Timings (seconds)
     GESTURE_COOLDOWN: float = 0.45
@@ -398,14 +398,16 @@ def detect_gestures(
             
             # Visual feedback
             if state.scroll_direction != 0:
-                cv2.circle(frame, px[LM_INDEX_TIP], 12, (0, 0, 255), -1)  # Red circle (BGR format)
+                glow_color = (0, 0, 255) if state.scroll_direction == 1 else (255, 0, 0)
+                draw_neon_glow(frame, px[LM_INDEX_TIP], glow_color, 15)
                 tip_x, tip_y = px[LM_INDEX_TIP]
-                # Blue arrow showing scroll direction
+                # Blue arrow showing scroll direction (more robust)
+                arrow_c = (255, 128, 0)
                 if state.scroll_direction == 1:
-                    cv2.arrowedLine(frame, (tip_x, tip_y + 30), (tip_x, tip_y - 30), (255, 0, 0), 4, tipLength=0.3)
+                    cv2.arrowedLine(frame, (tip_x, tip_y + 45), (tip_x, tip_y - 15), arrow_c, 4, tipLength=0.3)
                     hud.append("Right: Scroll UP")
                 elif state.scroll_direction == -1:
-                    cv2.arrowedLine(frame, (tip_x, tip_y - 30), (tip_x, tip_y + 30), (255, 0, 0), 4, tipLength=0.3)
+                    cv2.arrowedLine(frame, (tip_x, tip_y - 45), (tip_x, tip_y + 15), arrow_c, 4, tipLength=0.3)
                     hud.append("Right: Scroll DOWN")
 
             # --- Right Click Gesture (Pinch) ---
@@ -452,7 +454,7 @@ def detect_gestures(
             
             # Visual: Green circle and Purple arrow
             if state.volume_direction != 0:
-                cv2.circle(frame, px[LM_WRIST], 15, (0, 255, 0), -1)
+                draw_neon_glow(frame, px[LM_WRIST], (0, 255, 128), 20)
                 if state.volume_direction == 1:
                     cv2.arrowedLine(frame, (wrist_x, wrist_y + 40), (wrist_x, wrist_y - 40), (255, 0, 255), 4, tipLength=0.3)
                     hud.append("Right: Vol UP")
@@ -775,6 +777,37 @@ def draw_text_with_bg(
     cv2.rectangle(overlay, (x - 5, y - th - 5), (x + tw + 5, y + 5), bg_color, -1)
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
     cv2.putText(frame, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+ 
+def draw_neon_glow(frame: np.ndarray, point: tuple[int, int], color: tuple[int, int, int], radius: int) -> None:
+    """Draws multi-layered transparent circles for a neon/glow look."""
+    overlay = frame.copy()
+    for r in range(radius, radius + 15, 3):
+        alpha = 0.5 - (r - radius) / 30.0
+        if alpha <= 0: break
+        cv2.circle(overlay, point, r, color, -1)
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+ 
+def draw_premium_dashboard(frame: np.ndarray, detected_hands: list[str]) -> None:
+    """Header bar with AI status and hand icons."""
+    h, w = frame.shape[:2]
+    # Header box
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 50), (30, 30, 30), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+    
+    # Text
+    cv2.putText(frame, "PRO AI GESTURE CENTER v2.0", (15, 32), cv2.FONT_HERSHEY_DUPLEX, 0.65, (0, 220, 255), 1, cv2.LINE_AA)
+    
+    # Hand indicators in top right
+    right_on = "Right" in detected_hands
+    left_on = "Left" in detected_hands
+    
+    # Right hand status
+    rc = (0, 255, 0) if right_on else (100, 100, 100)
+    draw_text_with_bg(frame, "RIGHT", (w - 180, 32), scale=0.45, color=rc)
+    # Left hand status
+    lc = (0, 255, 0) if left_on else (100, 100, 100)
+    draw_text_with_bg(frame, "LEFT ", (w - 100, 32), scale=0.45, color=lc)
 
 
 def main() -> None:
@@ -836,10 +869,15 @@ def main() -> None:
             if result.hand_landmarks:
                 for lm_list in result.hand_landmarks:
                     draw_hand_connections_bgr(frame, lm_list, HAND_CONNECTIONS)
-            y0 = 30
+ 
+            # Premium Visual UI
+            current_hand_labels = [h.label for h in hands_list]
+            draw_premium_dashboard(frame, current_hand_labels)
+ 
+            y0 = 85
             for msg in hud_events[:CONFIG.HISTORY_SIZE]:
-                draw_text_with_bg(frame, msg, (15, y0), color=(0, 255, 128), scale=0.55)
-                y0 += 28
+                draw_text_with_bg(frame, f" > {msg}", (15, y0), color=(0, 255, 200), scale=0.5, bg_color=(20, 20, 20))
+                y0 += 32
  
             # Update the window tab/title with the persistent history
             history_str = control_state.get_title_status(now)
