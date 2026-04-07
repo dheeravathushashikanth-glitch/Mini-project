@@ -593,15 +593,108 @@ def handle_controls(
 # ─────────────────────────────────────────────────────────────────────────────
 WIN = "Hand Gesture Control"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Camera initialisation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_backends() -> list[tuple[str, int]]:
+    """Return a list of (name, cv2 backend constant) to try."""
+    if sys.platform == "win32":
+        return [
+            ("MSMF",       cv2.CAP_MSMF),
+            ("DirectShow", cv2.CAP_DSHOW),
+            ("Default",    cv2.CAP_ANY),
+        ]
+    return [("Default", cv2.CAP_ANY)]
+
+
+def _frames_are_valid(
+    cap: cv2.VideoCapture,
+    attempts: int = 30,
+    threshold: float = 5.0,
+) -> bool:
+    """Read up to *attempts* frames and return True as soon as a non-blank
+    frame is received.  A frame is considered blank when its mean pixel
+    value is below *threshold* (i.e. near-black)."""
+    for _ in range(attempts):
+        ok, frame = cap.read()
+        if ok and frame is not None and frame.mean() > threshold:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _find_working_camera() -> cv2.VideoCapture | None:
+    """Iterate camera indices × backends and return the first combination
+    that actually delivers non-blank frames.
+
+    On Windows, cameras sometimes report ``isOpened() == True`` with a
+    certain backend but only deliver black frames.  This function
+    validates real frame delivery before accepting a camera.
+    """
+    backends = _get_backends()
+
+    for cam_index in range(3):           # try indices 0, 1, 2
+        for name, backend in backends:
+            print(f"[camera] Trying index {cam_index} / {name} …", flush=True)
+            cap = cv2.VideoCapture(cam_index, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            # Set a modest resolution for the probe — we'll raise it later
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+            if _frames_are_valid(cap):
+                print(
+                    f"[camera] ✓ Working camera found: index {cam_index}, "
+                    f"backend {name}",
+                    flush=True,
+                )
+                return cap
+
+            print(f"[camera]   opened but frames are blank – skipping.", flush=True)
+            cap.release()
+
+    return None
+
+
 def main() -> None:
     pyautogui.FAILSAFE = False  # prevent accidental failsafe corner-quit
 
     screen_w, screen_h = pyautogui.size()
 
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW if sys.platform == "win32" else 0)
+    # ── Open the camera with robust fallback logic ─────────────────────────
+    cap = _find_working_camera()
+
+    if cap is None:
+        print(
+            "\n[ERROR] Could not get frames from any camera.\n"
+            "  Troubleshooting steps:\n"
+            "  1. Make sure your webcam is plugged in and not used by another app.\n"
+            "  2. On Windows 10/11 check:\n"
+            "       Settings → Privacy & Security → Camera\n"
+            "     and ensure 'Let desktop apps access your camera' is ON.\n"
+            "  3. Update your camera driver via Device Manager → Cameras.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Request preferred resolution / FPS (camera will use closest supported)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
     cap.set(cv2.CAP_PROP_FPS,           30)
+
+    # Verify what the camera actually accepted
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[camera] Resolution: {actual_w}×{actual_h}", flush=True)
+
+    # If the camera rejected our preferred resolution, keep whatever it
+    # gave us — the rest of the code adapts to any frame size.
+    if actual_w == 0 or actual_h == 0:
+        print("[camera] Could not query resolution; using camera default.", flush=True)
 
     model_path   = ensure_hand_landmarker_model()
     hand_options = mp_hand_landmarker.HandLandmarkerOptions(
@@ -624,7 +717,9 @@ def main() -> None:
     with mp_hand_landmarker.HandLandmarker.create_from_options(hand_options) as landmarker:
         while cap.isOpened():
             ok, frame = cap.read()
-            if not ok:
+            if not ok or frame is None:
+                # Brief sleep to avoid busy-looping if the camera stalls
+                time.sleep(0.01)
                 continue
 
             frame      = cv2.flip(frame, 1)
