@@ -1,5 +1,5 @@
 """
-Unified hand-gesture desktop control — Zero-Collision 10-Function Engine.
+Unified hand-gesture desktop control -- Zero-Collision 10-Function Engine.
 
 Uses MediaPipe HandLandmarker (Tasks API), OpenCV, PyAutoGUI.
 Forked from: https://github.com/varshithdharmaj/hand-gesture-virtual-mouse
@@ -87,8 +87,8 @@ GESTURE_COLORS: dict[str, tuple] = {
 class AppConfig:
     """Zero-collision 10-function gesture configuration."""
     # Touch thresholds (pixels)
-    INDEX_THUMB_TOUCH:  int   = 38
-    MIDDLE_THUMB_TOUCH: int   = 38
+    INDEX_THUMB_TOUCH:  int   = 50
+    MIDDLE_THUMB_TOUCH: int   = 50
 
     # Motion thresholds (pixels per frame)
     SCROLL_DELTA_Y:  int = 12
@@ -140,7 +140,7 @@ def ensure_hand_landmarker_model() -> Path:
     model_path = models_dir / MODEL_FILENAME
     if model_path.is_file() and model_path.stat().st_size > 0:
         return model_path
-    print(f"Downloading {MODEL_FILENAME} (first run only)…")
+    print(f"Downloading {MODEL_FILENAME} (first run only)...")
     urllib.request.urlretrieve(MODEL_URL, model_path)
     print(f"Saved to {model_path}")
     return model_path
@@ -155,10 +155,10 @@ def dist_px(p: tuple[int, int], q: tuple[int, int]) -> float:
     return math.hypot(q[0] - p[0], q[1] - p[1])
 
 def finger_extended_from_wrist(lm, tip_i: int, pip_i: int, wrist_i: int = LM_WRIST) -> bool:
-    return dist_norm(lm[tip_i], lm[wrist_i]) > dist_norm(lm[pip_i], lm[wrist_i]) * 1.18
+    return dist_norm(lm[tip_i], lm[wrist_i]) > dist_norm(lm[pip_i], lm[wrist_i]) * 1.08
 
 def thumb_extended(lm) -> bool:
-    return dist_norm(lm[LM_THUMB_TIP], lm[LM_WRIST]) > dist_norm(lm[LM_THUMB_IP], lm[LM_WRIST]) * 1.12
+    return dist_norm(lm[LM_THUMB_TIP], lm[LM_WRIST]) > dist_norm(lm[LM_THUMB_IP], lm[LM_WRIST]) * 1.05
 
 def finger_states(lm) -> dict[str, bool]:
     return {
@@ -172,12 +172,13 @@ def finger_states(lm) -> dict[str, bool]:
 def classify_hand_pose(fs: dict[str, bool]) -> GestureId:
     idx, mid, ring, pinky, thumb = fs["index"], fs["middle"], fs["ring"], fs["pinky"], fs["thumb"]
     n = sum([idx, mid, ring, pinky])
+    # ★ OPEN_PALM must be checked BEFORE FOUR_FINGERS to avoid shadowing
+    if thumb and idx and mid and ring and pinky:          return GestureId.OPEN_PALM
     if n == 0 and not thumb:                              return GestureId.FIST
     if n == 1 and idx:                                    return GestureId.INDEX_ONLY
     if n == 2 and idx and mid and not ring and not pinky: return GestureId.TWO_FINGERS
     if n == 3 and idx and mid and ring and not pinky:     return GestureId.THREE_FINGERS
-    if n == 4 and idx and mid and ring and pinky:         return GestureId.FOUR_FINGERS
-    if thumb and idx and mid and ring and pinky:          return GestureId.OPEN_PALM
+    if n == 4 and idx and mid and ring and pinky and not thumb: return GestureId.FOUR_FINGERS
     return GestureId.OTHER
 
 
@@ -305,7 +306,7 @@ def draw_neon_line(
     color: tuple[int, int, int],
     thickness: int = 2,
 ) -> None:
-    """Glowing line — outer dark halo + bright inner."""
+    """Glowing line -- outer dark halo + bright inner."""
     cv2.line(frame, p1, p2, tuple(c // 4 for c in color), thickness + 6, cv2.LINE_AA)
     cv2.line(frame, p1, p2, color, thickness, cv2.LINE_AA)
 
@@ -565,7 +566,7 @@ def handle_controls(
                 state.add_event("Left Click", now)
             return
 
-        # Cursor Move — scale to non-panel area
+        # Cursor Move -- scale to non-panel area
         t8 = lm[LM_INDEX_TIP]
         sx = int(t8.x * screen_w)
         sy = int(t8.y * screen_h)
@@ -593,49 +594,205 @@ def handle_controls(
 # ─────────────────────────────────────────────────────────────────────────────
 WIN = "Hand Gesture Control"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Camera initialisation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_backends() -> list[tuple[str, int]]:
+    """Return a list of (name, cv2 backend constant) to try."""
+    if sys.platform == "win32":
+        return [
+            ("MSMF",       cv2.CAP_MSMF),
+            ("DirectShow", cv2.CAP_DSHOW),
+            ("Default",    cv2.CAP_ANY),
+        ]
+    return [("Default", cv2.CAP_ANY)]
+
+
+def _frames_are_valid(
+    cap: cv2.VideoCapture,
+    attempts: int = 30,
+    threshold: float = 5.0,
+) -> bool:
+    """Read up to *attempts* frames and return True as soon as a non-blank
+    frame is received.  A frame is considered blank when its mean pixel
+    value is below *threshold* (i.e. near-black)."""
+    for _ in range(attempts):
+        ok, frame = cap.read()
+        if ok and frame is not None and frame.mean() > threshold:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _find_working_camera() -> tuple[cv2.VideoCapture, int, int] | None:
+    """Iterate camera indices x backends and return the first combination
+    that actually delivers non-blank frames.
+
+    Returns ``(cap, cam_index, backend)`` or ``None``.
+
+    On Windows, cameras sometimes report ``isOpened() == True`` with a
+    certain backend but only deliver black frames.  This function
+    validates real frame delivery before accepting a camera.
+    """
+    backends = _get_backends()
+
+    for cam_index in range(3):           # try indices 0, 1, 2
+        for name, backend in backends:
+            print(f"[camera] Trying index {cam_index} / {name} ...", flush=True)
+            cap = cv2.VideoCapture(cam_index, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            # Set a modest resolution for the probe -- we'll raise it later
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+            if _frames_are_valid(cap):
+                print(
+                    f"[camera] OK Working camera found: index {cam_index}, "
+                    f"backend {name}",
+                    flush=True,
+                )
+                return cap, cam_index, backend
+
+            print(f"[camera]   opened but frames are blank - skipping.", flush=True)
+            cap.release()
+
+    return None
+
+
+def _open_camera_with_resolution(
+    cam_index: int,
+    backend: int,
+    width: int = 1280,
+    height: int = 720,
+    fps: int = 30,
+) -> cv2.VideoCapture:
+    """Open a fresh VideoCapture at the desired resolution.
+
+    Changing resolution properties on an already-open capture can corrupt
+    the internal buffer stride on some Windows MSMF drivers, causing
+    ``cv2.error: (-215:Assertion failed) _step >= minstep``.
+    Reopening avoids this entirely.
+    """
+    cap = cv2.VideoCapture(cam_index, backend)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS,          fps)
+    return cap
+
+
 def main() -> None:
     pyautogui.FAILSAFE = False  # prevent accidental failsafe corner-quit
 
     screen_w, screen_h = pyautogui.size()
 
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW if sys.platform == "win32" else 0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
-    cap.set(cv2.CAP_PROP_FPS,           30)
+    # ── Open the camera with robust fallback logic ─────────────────────────
+    result = _find_working_camera()
+
+    if result is None:
+        print(
+            "\n[ERROR] Could not get frames from any camera.\n"
+            "  Troubleshooting steps:\n"
+            "  1. Make sure your webcam is plugged in and not used by another app.\n"
+            "  2. On Windows 10/11 check:\n"
+            "       Settings → Privacy & Security → Camera\n"
+            "     and ensure 'Let desktop apps access your camera' is ON.\n"
+            "  3. Update your camera driver via Device Manager → Cameras.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    probe_cap, cam_index, backend = result
+    # Release the probe capture and reopen with the desired resolution.
+    # Changing resolution on an already-open capture can corrupt the
+    # internal buffer stride on Windows MSMF drivers, causing:
+    #   cv2.error: (-215:Assertion failed) _step >= minstep
+    probe_cap.release()
+    cap = _open_camera_with_resolution(cam_index, backend, 1280, 720, 30)
+
+    if not cap.isOpened():
+        print("[camera] Failed to reopen camera at target resolution; "
+              "falling back to probe capture.", flush=True)
+        cap = cv2.VideoCapture(cam_index, backend)
+
+    # Verify what the camera actually accepted
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[camera] Resolution: {actual_w}x{actual_h}", flush=True)
+
+    # If the camera rejected our preferred resolution, keep whatever it
+    # gave us -- the rest of the code adapts to any frame size.
+    if actual_w == 0 or actual_h == 0:
+        print("[camera] Could not query resolution; using camera default.", flush=True)
 
     model_path   = ensure_hand_landmarker_model()
     hand_options = mp_hand_landmarker.HandLandmarkerOptions(
         base_options=mp_base_options.BaseOptions(model_asset_path=str(model_path)),
         running_mode=mp_vision_mode.VisionTaskRunningMode.VIDEO,
         num_hands=2,
-        min_hand_detection_confidence=0.70,
-        min_hand_presence_confidence=0.50,
-        min_tracking_confidence=0.50,
+        min_hand_detection_confidence=0.35,
+        min_hand_presence_confidence=0.30,
+        min_tracking_confidence=0.30,
     )
 
-    frame_ts_ms   = 0
+    # Use real wall-clock time for MediaPipe VIDEO mode timestamps.
+    # Fixed increments (e.g. +=33) can confuse temporal tracking and
+    # cause detection to silently fail.
+    _start_time  = time.monotonic()
+    _last_detect_log = 0  # throttle debug logging
     control_state = ControlState()
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 50  # reopen camera after this many failures
 
-    # ── Create window — always on top so gestures never close it ────────────
+    # ── Create window -- always on top so gestures never close it ────────────
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, 1280, 720)
     cv2.setWindowProperty(WIN, cv2.WND_PROP_TOPMOST, 1)   # ★ stays on top
 
     with mp_hand_landmarker.HandLandmarker.create_from_options(hand_options) as landmarker:
         while cap.isOpened():
-            ok, frame = cap.read()
-            if not ok:
+            # Wrap cap.read() in try/except to handle OpenCV assertion
+            # errors that some camera drivers can raise mid-stream.
+            try:
+                ok, frame = cap.read()
+            except cv2.error as e:
+                print(f"[camera] cv2.error during read: {e}", flush=True)
+                ok, frame = False, None
+
+            if not ok or frame is None:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    print("[camera] Too many consecutive read failures; "
+                          "attempting to reopen camera ...", flush=True)
+                    cap.release()
+                    cap = _open_camera_with_resolution(
+                        cam_index, backend, 1280, 720, 30
+                    )
+                    consecutive_failures = 0
+                # Brief sleep to avoid busy-looping if the camera stalls
+                time.sleep(0.01)
                 continue
 
+            consecutive_failures = 0
             frame      = cv2.flip(frame, 1)
             fh, fw     = frame.shape[:2]
             now        = time.monotonic()
-            frame_ts_ms += 33
+            frame_ts_ms = int((now - _start_time) * 1000)
 
             # ── MediaPipe inference ─────────────────────────────────────────
             rgb    = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             mp_img = MpImage(image_format=ImageFormat.SRGB, data=rgb)
             result = landmarker.detect_for_video(mp_img, frame_ts_ms)
+
+            # Debug: log detection results periodically
+            if now - _last_detect_log > 3.0:
+                n_hands = len(result.hand_landmarks) if result.hand_landmarks else 0
+                print(f"[debug] ts={frame_ts_ms}ms  hands_detected={n_hands}  "
+                      f"frame_size={fw}x{fh}", flush=True)
+                _last_detect_log = now
 
             hands: list[HandSnapshot] = []
             if result.hand_landmarks and result.handedness:
@@ -645,6 +802,26 @@ def main() -> None:
 
             # ── Gesture logic ───────────────────────────────────────────────
             handle_controls(frame, hands, control_state, now, screen_w, screen_h)
+
+            # ── On-screen debug: show detected gesture + finger states ─────
+            if hands:
+                hs0 = hands[0]
+                gesture_name = hs0.gesture.name
+                fs = hs0.fs
+                fingers_str = " ".join(
+                    f"{k[0].upper()}" if v else f"{k[0].lower()}"
+                    for k, v in fs.items()
+                )
+                debug_text = f"Gesture: {gesture_name}  [{fingers_str}]"
+                draw_text_neon(
+                    frame, debug_text, (10, fh - 20),
+                    color=CLR_YELLOW, scale=0.50,
+                )
+            else:
+                draw_text_neon(
+                    frame, "No hand detected", (10, fh - 20),
+                    color=CLR_RED, scale=0.50,
+                )
 
             # ── Draw skeletons ──────────────────────────────────────────────
             if result.hand_landmarks:
