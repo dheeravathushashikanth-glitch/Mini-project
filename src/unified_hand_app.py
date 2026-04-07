@@ -59,63 +59,42 @@ LM_PINKY_PIP = 18
 
 @dataclass(frozen=True)
 class AppConfig:
-    """Centralized configuration for all thresholds and timings."""
-    # Detection
-    CLICK_THRESHOLD: int = 30
-    PINCH_MAX_DIST: int = 38
-    TWO_FINGER_TIP_MAX: int = 45
-    
-    # Volume Gestures
-    INDEX_MIDDLE_VOL_DOWN_LO: int = 40
-    INDEX_MIDDLE_VOL_DOWN_HI: int = 100
-    INDEX_MIDDLE_VOL_UP_MIN: int = 100
-    HAND_VOL_DELTA_MIN: int = 20
-    
-    # Navigation
-    THUMB_MIDDLE_TAB_MIN: int = 150
-    INDEX_PINKY_NEW_TAB_MIN: int = 180
-    INDEX_PINKY_OPEN_NORM: float = 0.22
-    SWIPE_ACCUM_PX: int = 120
-    SWIPE_DECAY: float = 0.85
-    
-    # Scrolling
-    SCROLL_STEP_ACCUM: int = 20
-    PINCH_SCROLL_ACCUM: int = 28
-    HSCROLL_ACCUM: int = 40
-    MOBILE_SCROLL_DELTA_MIN: int = 8
-    
-    # Timings (seconds)
-    GESTURE_COOLDOWN: float = 0.45
-    TAB_HOTKEY_COOLDOWN: float = 0.55
-    VOLUME_COOLDOWN: float = 0.12
-    MOBILE_SCROLL_RESET: float = 0.2
-    RIGHT_CLICK_COOLDOWN: float = 0.3
-    CURSOR_SMOOTH_DURATION: float = 0.1
-    POSE_HUD_COOLDOWN: float = 0.8
-    WINDOW_TITLE_PERSISTENCE: float = 2.0
-    
+    """Zero-collision 10-function gesture configuration."""
+    # Touch thresholds (pixels)
+    INDEX_THUMB_TOUCH: int = 38    # Left Click: Index tip + Thumb tip
+    MIDDLE_THUMB_TOUCH: int = 38   # Right Click: Middle tip + Thumb tip
+
+    # Motion thresholds (pixels per frame)
+    SCROLL_DELTA_Y: int = 12       # Scroll: vertical movement of Index+Middle
+    SWITCH_TAB_DELTA_X: int = 30   # Switch Tab: horizontal swipe of Index+Middle
+    SWITCH_TAB_ACCUM: int = 60     # Accumulate px before firing tab switch
+
+    # Cursor smoothing
+    CURSOR_SMOOTH_DURATION: float = 0.06
+
+    # Cooldowns (seconds)
+    CLICK_COOLDOWN: float = 0.4
+    VOLUME_COOLDOWN: float = 0.35
+    TAB_COOLDOWN: float = 0.5
+    NEW_TAB_COOLDOWN: float = 1.0
+    SCROLL_COOLDOWN: float = 0.08
+
     # UI
     HISTORY_SIZE: int = 5
+    WINDOW_TITLE_PERSISTENCE: float = 2.0
 
 CONFIG = AppConfig()
 
 
 class GestureId(IntEnum):
-    """
-    Unified pose identifiers: fist, isolated fingers, V-shape, two-finger cluster,
-    and pinch-derived majors/minors handled separately in ``detect_gestures``.
-    """
-
-    FIST = 0
-    PINKY = 1
-    RING = 2
-    MID = 4
-    INDEX = 8
-    V_GEST = 33
-    TWO_FINGER_CLOSED = 34
-    PINCH_MAJOR = 35
-    PINCH_MINOR = 36
-    NONE = 99
+    """Finger-count based gesture IDs for the 10-function zero-collision system."""
+    FIST = 0          # 0 fingers: Pause/Resume
+    INDEX_ONLY = 1    # 1 finger (index): Cursor Move  
+    TWO_FINGERS = 2   # 2 fingers (index+middle): Scroll / Switch Tab
+    THREE_FINGERS = 3 # 3 fingers (index+middle+ring): Volume Up
+    FOUR_FINGERS = 4  # 4 fingers (no thumb): Volume Down
+    OPEN_PALM = 5     # 5 fingers: Open New Tab
+    OTHER = 9         # Anything else (thumb alone, etc.)
 
 
 def _repo_root() -> Path:
@@ -173,22 +152,23 @@ def finger_states(lm) -> dict[str, bool]:
 
 
 def classify_hand_pose(fs: dict[str, bool]) -> GestureId:
-    """Map extended fingers to a single dominant pose label."""
-    n_up = sum(1 for k in ("index", "middle", "ring", "pinky") if fs[k])
-    if n_up == 0 and not fs["thumb"]:
-        return GestureId.FIST
-    if n_up == 1:
-        if fs["pinky"]:
-            return GestureId.PINKY
-        if fs["ring"]:
-            return GestureId.RING
-        if fs["middle"]:
-            return GestureId.MID
-        if fs["index"]:
-            return GestureId.INDEX
-    if fs["index"] and fs["middle"] and not fs["ring"] and not fs["pinky"]:
-        return GestureId.V_GEST
-    return GestureId.NONE
+    """Zero-collision classifier: purely based on which fingers are extended."""
+    idx  = fs["index"]
+    mid  = fs["middle"]
+    ring = fs["ring"]
+    pinky= fs["pinky"]
+    thumb= fs["thumb"]
+
+    n_fingers = sum([idx, mid, ring, pinky])  # thumb excluded from count
+
+    if n_fingers == 0 and not thumb:  return GestureId.FIST
+    if n_fingers == 1 and idx:        return GestureId.INDEX_ONLY
+    if n_fingers == 2 and idx and mid and not ring and not pinky: return GestureId.TWO_FINGERS
+    if n_fingers == 3 and idx and mid and ring and not pinky:     return GestureId.THREE_FINGERS
+    if n_fingers == 4 and idx and mid and ring and pinky:         return GestureId.FOUR_FINGERS
+    if n_fingers == 4 and thumb and idx and mid and ring and pinky: return GestureId.OPEN_PALM
+    if thumb and idx and mid and ring and pinky:                  return GestureId.OPEN_PALM
+    return GestureId.OTHER
 
 
 @dataclass
@@ -197,127 +177,71 @@ class HandSnapshot:
     lm: list
     px: list[tuple[int, int]]
     fs: dict[str, bool]
-    d_index_middle: float
-    d_thumb_middle: float
-    d_index_pinky: float
-    d_thumb_index: float
-    pinch_mid_norm: tuple[float, float]
+    d_thumb_index: float   # Index + Thumb distance  -> Left Click
+    d_thumb_middle: float  # Middle + Thumb distance -> Right Click
+    midpoint_im: tuple[int, int]  # Midpoint of Index+Middle for scroll/tab tracking
     gesture: GestureId
-    midpoint_im_scroll: tuple[int, int]
 
 
 def build_hand_snapshot(label: str, lm, w: int, h: int) -> HandSnapshot:
     px = [lm_to_px(lm[i], w, h) for i in range(21)]
     fs = finger_states(lm)
-    d_im = dist_px(px[LM_INDEX_TIP], px[LM_MIDDLE_TIP])
-    d_tm = dist_px(px[LM_THUMB_TIP], px[LM_MIDDLE_TIP])
-    d_ipk = dist_px(px[LM_INDEX_TIP], px[LM_PINKY_TIP])
-    d_ti = dist_px(px[LM_THUMB_TIP], px[LM_INDEX_TIP])
-    mid_ix = (px[LM_INDEX_TIP][0] + px[LM_MIDDLE_TIP][0]) // 2
-    mid_iy = (px[LM_INDEX_TIP][1] + px[LM_MIDDLE_TIP][1]) // 2
+    d_ti  = dist_px(px[LM_THUMB_TIP], px[LM_INDEX_TIP])
+    d_tm  = dist_px(px[LM_THUMB_TIP], px[LM_MIDDLE_TIP])
+    mid_x = (px[LM_INDEX_TIP][0] + px[LM_MIDDLE_TIP][0]) // 2
+    mid_y = (px[LM_INDEX_TIP][1] + px[LM_MIDDLE_TIP][1]) // 2
     g = classify_hand_pose(fs)
-    if fs["index"] and fs["middle"] and d_im < CONFIG.TWO_FINGER_TIP_MAX:
-        g = GestureId.TWO_FINGER_CLOSED
-    pinch_mid = (
-        (lm[LM_THUMB_TIP].x + lm[LM_INDEX_TIP].x) * 0.5,
-        (lm[LM_THUMB_TIP].y + lm[LM_INDEX_TIP].y) * 0.5,
-    )
     return HandSnapshot(
         label=label,
         lm=lm,
         px=px,
         fs=fs,
-        d_index_middle=d_im,
-        d_thumb_middle=d_tm,
-        d_index_pinky=d_ipk,
         d_thumb_index=d_ti,
-        pinch_mid_norm=pinch_mid,
+        d_thumb_middle=d_tm,
+        midpoint_im=(mid_x, mid_y),
         gesture=g,
-        midpoint_im_scroll=(mid_ix, mid_iy),
     )
 
 
 @dataclass
 class ControlState:
-    """
-    Edge-triggered actions: ``held_actions`` clears when the condition goes False.
-    Per-hand dicts use MediaPipe ``Left`` / ``Right`` labels.
-    """
+    """State for zero-collision 10-function gesture system."""
 
-    held_actions: dict[str, bool] = field(default_factory=dict)
+    # Cooldown tracking
     last_fire_time: dict[str, float] = field(default_factory=dict)
-    drag_armed: bool = False
-    pinch_mid_norm: dict[str, tuple[float, float]] = field(default_factory=dict)
-    pinch_major_acc: dict[str, float] = field(default_factory=dict)
-    pinch_minor_acc: dict[str, float] = field(default_factory=dict)
-    scroll_last_im: dict[str, tuple[int, int]] = field(default_factory=dict)
-    scroll_acc: dict[str, float] = field(default_factory=dict)
-    swipe_vel_x: float = 0.0
-    swipe_vel_y: float = 0.0
-    prev_index_tip: tuple[int, int] | None = None
 
-    # New Mobile Scroll state
-    scroll_flag: bool = False
-    mobile_scroll_last_time: float = 0.0
-    prev_index_y: float | None = None
-    scroll_direction: int = 0
+    # Two-finger midpoint tracking for Scroll and Switch Tab
+    prev_two_finger_mid: tuple[int, int] | None = None
+    tab_swipe_acc: float = 0.0
 
-    # New Right Click state (Pinch)
-    right_click_flag: bool = False
-    right_click_last_time: float = 0.0
+    # System pause toggle (Closed Fist)
+    system_paused: bool = False
+    fist_fired: bool = False  # so fist only toggles once per hold
 
-    # New Volume Control state (Whole Hand)
-    volume_flag: bool = False
-    volume_last_time: float = 0.0
-    prev_avg_hand_y: float | None = None
-    volume_direction: int = 0
-
-    # Gesture History tracking
+    # Gesture history for HUD
     history: deque[str] = field(default_factory=lambda: deque(maxlen=CONFIG.HISTORY_SIZE))
     last_event_time: float = 0.0
 
+    def cooldown_ok(self, key: str, now: float, cooldown: float) -> bool:
+        """Returns True if enough time has passed since last fire for this key."""
+        if now - self.last_fire_time.get(key, 0.0) >= cooldown:
+            self.last_fire_time[key] = now
+            return True
+        return False
+
     def add_event(self, event: str, now: float) -> None:
-        """Adds a gesture event to the history and updates the timestamp."""
         if not self.history or self.history[-1] != event:
             self.history.append(event)
         self.last_event_time = now
 
     def get_title_status(self, now: float) -> str:
-        """Returns a string representing the recent gesture history."""
         if not self.history:
             return ""
-        # If quiet for a while, we could potentially clear or fade, 
-        # but the user asked to 'keep it for a while'.
         return " | ".join(list(self.history))
 
 
-def _held_reset(state: ControlState, key: str) -> None:
-    state.held_actions[key] = False
-
-
-def pulse_action(
-    state: ControlState,
-    key: str,
-    condition: bool,
-    now: float,
-    min_interval: float,
-    action: Callable[[], None],
-) -> bool:
-    if not condition:
-        _held_reset(state, key)
-        return False
-    if state.held_actions.get(key):
-        return False
-    if now - state.last_fire_time.get(key, 0.0) < min_interval:
-        return False
-    state.held_actions[key] = True
-    state.last_fire_time[key] = now
-    action()
-    return True
-
-
 def draw_green_pair(frame: np.ndarray, p: tuple[int, int], q: tuple[int, int]) -> None:
-    """Green segment between fingertips used for distance-based rules."""
+    """Green segment between fingertips."""
     cv2.line(frame, p, q, (0, 255, 0), 2)
 
 
@@ -338,315 +262,6 @@ def draw_hand_connections_bgr(
         cv2.circle(frame_bgr, p, 3, point_color, -1)
 
 
-def detect_gestures(
-    frame: np.ndarray,
-    hands: list[HandSnapshot],
-    state: ControlState,
-    now: float,
-    screen_w: int,
-    screen_h: int,
-) -> list[str]:
-    """
-    All non-cursor discrete/continuous gestures: fist drag, pinch axes, two-finger scroll,
-    volume, tab hotkeys, optional single-finger HUD labels.
-    """
-    hud: list[str] = []
-
-    any_fist = any(h.gesture == GestureId.FIST for h in hands)
-    if any_fist:
-        if not state.drag_armed:
-            pyautogui.mouseDown()
-            state.drag_armed = True
-            hud.append("FIST: drag")
-    else:
-        if state.drag_armed:
-            pyautogui.mouseUp()
-            state.drag_armed = False
-
-    active_two_finger_labels: set[str] = set()
-
-    for hs in hands:
-        label = hs.label
-        px = hs.px
-        pinched = hs.d_thumb_index < CONFIG.PINCH_MAX_DIST
-
-        # Mobile Scroll Gesture (Right Hand Only)
-        if label == "Right":
-            current_y = px[LM_INDEX_TIP][1]
-            
-            # Reset flag after timeout
-            if state.scroll_flag and (now - state.mobile_scroll_last_time) > CONFIG.MOBILE_SCROLL_RESET:
-                state.scroll_flag = False
-                state.scroll_direction = 0
-                
-            if state.prev_index_y is not None:
-                delta_y = current_y - state.prev_index_y
-                if abs(delta_y) > CONFIG.MOBILE_SCROLL_DELTA_MIN and not state.scroll_flag:
-                    if delta_y < -CONFIG.MOBILE_SCROLL_DELTA_MIN:  # Moving UP
-                        pyautogui.scroll(3)
-                        state.scroll_direction = 1
-                        state.add_event("Scroll UP", now)
-                    elif delta_y > CONFIG.MOBILE_SCROLL_DELTA_MIN:  # Moving DOWN
-                        pyautogui.scroll(-3)
-                        state.scroll_direction = -1
-                        state.add_event("Scroll DOWN", now)
-                    
-                    state.scroll_flag = True
-                    state.mobile_scroll_last_time = now
-            
-            state.prev_index_y = current_y
-            
-            # Visual feedback
-            if state.scroll_direction != 0:
-                glow_color = (0, 0, 255) if state.scroll_direction == 1 else (255, 0, 0)
-                draw_neon_glow(frame, px[LM_INDEX_TIP], glow_color, 15)
-                tip_x, tip_y = px[LM_INDEX_TIP]
-                # Blue arrow showing scroll direction (more robust)
-                arrow_c = (255, 128, 0)
-                if state.scroll_direction == 1:
-                    cv2.arrowedLine(frame, (tip_x, tip_y + 45), (tip_x, tip_y - 15), arrow_c, 4, tipLength=0.3)
-                    hud.append("Right: Scroll UP")
-                elif state.scroll_direction == -1:
-                    cv2.arrowedLine(frame, (tip_x, tip_y - 45), (tip_x, tip_y + 15), arrow_c, 4, tipLength=0.3)
-                    hud.append("Right: Scroll DOWN")
-
-            # --- Right Click Gesture (Pinch) ---
-            dist_ti = hs.d_thumb_index
-            if state.right_click_flag and (now - state.right_click_last_time) > CONFIG.RIGHT_CLICK_COOLDOWN:
-                state.right_click_flag = False
-                
-            if dist_ti < 40 and not state.right_click_flag:
-                pyautogui.rightClick()
-                state.right_click_flag = True
-                state.right_click_last_time = now
-                state.add_event("Right Click", now)
-                
-            if dist_ti < 40:
-                # Visual: Yellow line
-                cv2.line(frame, px[LM_THUMB_TIP], px[LM_INDEX_TIP], (0, 255, 255), 2)
-                hud.append("Right: Right Click")
-                
-            # --- Volume Control Gesture (Whole Hand Movement) ---
-            wrist_x, wrist_y = px[LM_WRIST]
-            middle_y = px[LM_MIDDLE_TIP][1]
-            current_avg_y = (wrist_y + middle_y) / 2.0
-            
-            if state.volume_flag and (now - state.volume_last_time) > CONFIG.VOLUME_COOLDOWN:
-                state.volume_flag = False
-                state.volume_direction = 0
-                
-            if state.prev_avg_hand_y is not None:
-                delta_y = current_avg_y - state.prev_avg_hand_y
-                if abs(delta_y) > CONFIG.HAND_VOL_DELTA_MIN and not state.volume_flag:
-                    if delta_y < -CONFIG.HAND_VOL_DELTA_MIN:  # Hand moves UP
-                        pyautogui.press("volumeup")
-                        state.volume_direction = 1
-                        state.add_event("VOL UP", now)
-                    elif delta_y > CONFIG.HAND_VOL_DELTA_MIN:  # Hand moves DOWN
-                        pyautogui.press("volumedown")
-                        state.volume_direction = -1
-                        state.add_event("VOL DOWN", now)
-                        
-                    state.volume_flag = True
-                    state.volume_last_time = now
-            
-            state.prev_avg_hand_y = current_avg_y
-            
-            # Visual: Green circle and Purple arrow
-            if state.volume_direction != 0:
-                draw_neon_glow(frame, px[LM_WRIST], (0, 255, 128), 20)
-                if state.volume_direction == 1:
-                    cv2.arrowedLine(frame, (wrist_x, wrist_y + 40), (wrist_x, wrist_y - 40), (255, 0, 255), 4, tipLength=0.3)
-                    hud.append("Right: Vol UP")
-                elif state.volume_direction == -1:
-                    cv2.arrowedLine(frame, (wrist_x, wrist_y - 40), (wrist_x, wrist_y + 40), (255, 0, 255), 4, tipLength=0.3)
-                    hud.append("Right: Vol DOWN")
-
-        if pinched:
-            prev = state.pinch_mid_norm.get(label)
-            state.pinch_mid_norm[label] = hs.pinch_mid_norm
-            if prev is not None:
-                dx = (hs.pinch_mid_norm[0] - prev[0]) * screen_w
-                dy = (hs.pinch_mid_norm[1] - prev[1]) * screen_h
-                if abs(dy) > abs(dx) + 5:
-                    state.pinch_minor_acc[label] = 0.0
-                    state.pinch_major_acc[label] = (
-                        state.pinch_major_acc.get(label, 0.0) + dy
-                    )
-                    acc_y = state.pinch_major_acc[label]
-                    while acc_y > CONFIG.PINCH_SCROLL_ACCUM:
-                        pyautogui.scroll(-1)
-                        acc_y -= CONFIG.PINCH_SCROLL_ACCUM
-                        hud.append(f"{label}: PINCH_MAJOR ↓")
-                        state.add_event(f"{label} Scroll ↓", now)
-                    while acc_y < -CONFIG.PINCH_SCROLL_ACCUM:
-                        pyautogui.scroll(1)
-                        acc_y += CONFIG.PINCH_SCROLL_ACCUM
-                        hud.append(f"{label}: PINCH_MAJOR ↑")
-                        state.add_event(f"{label} Scroll ↑", now)
-                    state.pinch_major_acc[label] = acc_y
-                elif abs(dx) > abs(dy) + 5:
-                    state.pinch_major_acc[label] = 0.0
-                    state.pinch_minor_acc[label] = (
-                        state.pinch_minor_acc.get(label, 0.0) + dx
-                    )
-                    acc_x = state.pinch_minor_acc[label]
-                    while acc_x > CONFIG.HSCROLL_ACCUM:
-                        try:
-                            pyautogui.hscroll(1)
-                        except AttributeError:
-                            pyautogui.keyDown("shift")
-                            pyautogui.scroll(-1)
-                            pyautogui.keyUp("shift")
-                        acc_x -= CONFIG.HSCROLL_ACCUM
-                        hud.append(f"{label}: PINCH_MINOR →")
-                        state.add_event(f"{label} H-Scroll →", now)
-                    while acc_x < -CONFIG.HSCROLL_ACCUM:
-                        try:
-                            pyautogui.hscroll(-1)
-                        except AttributeError:
-                            pyautogui.keyDown("shift")
-                            pyautogui.scroll(1)
-                            pyautogui.keyUp("shift")
-                        acc_x += CONFIG.HSCROLL_ACCUM
-                        hud.append(f"{label}: PINCH_MINOR ←")
-                        state.add_event(f"{label} H-Scroll ←", now)
-                    state.pinch_minor_acc[label] = acc_x
-            draw_green_pair(frame, px[LM_THUMB_TIP], px[LM_INDEX_TIP])
-        else:
-            state.pinch_mid_norm.pop(label, None)
-            state.pinch_major_acc.pop(label, None)
-            state.pinch_minor_acc.pop(label, None)
-
-        if hs.gesture == GestureId.TWO_FINGER_CLOSED and not pinched:
-            active_two_finger_labels.add(label)
-            draw_green_pair(frame, px[LM_INDEX_TIP], px[LM_MIDDLE_TIP])
-            cy = hs.midpoint_im_scroll[1]
-            prev_im = state.scroll_last_im.get(label)
-            state.scroll_last_im[label] = hs.midpoint_im_scroll
-            if prev_im is not None:
-                dy = cy - prev_im[1]
-                acc = state.scroll_acc.get(label, 0.0) + dy
-                while acc > CONFIG.SCROLL_STEP_ACCUM:
-                    pyautogui.scroll(-1)
-                    acc -= CONFIG.SCROLL_STEP_ACCUM
-                    hud.append(f"{label}: 2-finger ↓")
-                    state.add_event(f"{label} 2-finger ↓", now)
-                while acc < -CONFIG.SCROLL_STEP_ACCUM:
-                    pyautogui.scroll(1)
-                    acc += CONFIG.SCROLL_STEP_ACCUM
-                    hud.append(f"{label}: 2-finger ↑")
-                    state.add_event(f"{label} 2-finger ↑", now)
-                state.scroll_acc[label] = acc
-
-        vol_pose = (
-            hs.fs["index"]
-            and hs.fs["middle"]
-            and hs.gesture != GestureId.TWO_FINGER_CLOSED
-            and not pinched
-        )
-        if vol_pose:
-            draw_green_pair(frame, px[LM_INDEX_TIP], px[LM_MIDDLE_TIP])
-            in_down = CONFIG.INDEX_MIDDLE_VOL_DOWN_LO < hs.d_index_middle < CONFIG.INDEX_MIDDLE_VOL_DOWN_HI
-            in_up = hs.d_index_middle > CONFIG.INDEX_MIDDLE_VOL_UP_MIN
-
-            def _vd() -> None:
-                pyautogui.press("volumedown")
-
-            def _vu() -> None:
-                pyautogui.press("volumeup")
-
-            if pulse_action(state, f"vd_{label}", in_down, now, CONFIG.VOLUME_COOLDOWN, _vd):
-                hud.append(f"{label}: Vol Down")
-                state.add_event(f"{label} VOL-", now)
-            if pulse_action(state, f"vu_{label}", in_up, now, CONFIG.VOLUME_COOLDOWN, _vu):
-                hud.append(f"{label}: Vol Up")
-                state.add_event(f"{label} VOL+", now)
-        else:
-            _held_reset(state, f"vd_{label}")
-            _held_reset(state, f"vu_{label}")
-
-        tab_cond = (
-            hs.fs["middle"]
-            and hs.d_thumb_middle > CONFIG.THUMB_MIDDLE_TAB_MIN
-            and not pinched
-        )
-        if tab_cond:
-            draw_green_pair(frame, px[LM_THUMB_TIP], px[LM_MIDDLE_TIP])
-
-            def _ctab() -> None:
-                pyautogui.hotkey("ctrl", "tab")
-
-            if pulse_action(
-                state, f"ctab_{label}", True, now, CONFIG.TAB_HOTKEY_COOLDOWN, _ctab
-            ):
-                hud.append(f"{label}: Ctrl+Tab")
-                state.add_event("Next Tab", now)
-        else:
-            _held_reset(state, f"ctab_{label}")
-
-        d_ip_norm = dist_norm(hs.lm[LM_INDEX_TIP], hs.lm[LM_PINKY_TIP])
-        new_tab_cond = (
-            hs.fs["index"]
-            and hs.fs["pinky"]
-            and (
-                hs.d_index_pinky > CONFIG.INDEX_PINKY_NEW_TAB_MIN
-                or d_ip_norm > CONFIG.INDEX_PINKY_OPEN_NORM
-            )
-            and not pinched
-        )
-        if new_tab_cond:
-            draw_green_pair(frame, px[LM_INDEX_TIP], px[LM_PINKY_TIP])
-
-            def _newt() -> None:
-                pyautogui.hotkey("ctrl", "t")
-
-            if pulse_action(
-                state, f"newt_{label}", True, now, CONFIG.TAB_HOTKEY_COOLDOWN, _newt
-            ):
-                hud.append(f"{label}: Ctrl+T")
-                state.add_event("New Tab", now)
-        else:
-            _held_reset(state, f"newt_{label}")
-
-        if (
-            hs.gesture
-            in (GestureId.PINKY, GestureId.RING, GestureId.MID, GestureId.INDEX)
-            and not pinched
-            and hs.gesture != GestureId.FIST
-        ):
-
-            def _noop() -> None:
-                return
-
-            if pulse_action(
-                state,
-                f"pose_{hs.gesture.name}_{label}",
-                True,
-                now,
-                CONFIG.POSE_HUD_COOLDOWN,
-                _noop,
-            ):
-                hud.append(f"{label}: {hs.gesture.name}")
-                state.add_event(f"Pose: {hs.gesture.name}", now)
-
-    for lbl in list(state.scroll_last_im.keys()):
-        if lbl not in active_two_finger_labels:
-            state.scroll_last_im.pop(lbl, None)
-            state.scroll_acc.pop(lbl, None)
-            
-    if "Right" not in [h.label for h in hands]:
-        state.prev_index_y = None
-        state.scroll_direction = 0
-        state.scroll_flag = False
-        state.prev_avg_hand_y = None
-        state.volume_direction = 0
-        state.volume_flag = False
-        state.right_click_flag = False
-
-    return hud
-
-
 def handle_controls(
     frame: np.ndarray,
     hands: list[HandSnapshot],
@@ -655,106 +270,155 @@ def handle_controls(
     screen_w: int,
     screen_h: int,
 ) -> list[str]:
-    """Run ``detect_gestures``, then swipe navigation, then pointer + button roles."""
-    hud = detect_gestures(frame, hands, state, now, screen_w, screen_h)
+    """
+    Zero-collision 10-function gesture dispatcher.
+    Priority order (highest first):
+      FIST -> OPEN_PALM -> FOUR_FINGERS -> THREE_FINGERS -> TWO_FINGERS -> INDEX_ONLY -> TOUCH checks
+    Only the FIRST matched gesture block executes per hand per frame.
+    """
+    hud: list[str] = []
 
-    if hands:
-        avg_ix = int(sum(h.px[LM_INDEX_TIP][0] for h in hands) / len(hands))
-        avg_iy = int(sum(h.px[LM_INDEX_TIP][1] for h in hands) / len(hands))
-        if state.prev_index_tip is None:
-            state.prev_index_tip = (avg_ix, avg_iy)
-        else:
-            pxv = avg_ix - state.prev_index_tip[0]
-            pyv = avg_iy - state.prev_index_tip[1]
-            state.prev_index_tip = (avg_ix, avg_iy)
-            state.swipe_vel_x = state.swipe_vel_x * CONFIG.SWIPE_DECAY + pxv
-            state.swipe_vel_y = state.swipe_vel_y * CONFIG.SWIPE_DECAY + pyv
+    if not hands:
+        state.prev_two_finger_mid = None
+        state.tab_swipe_acc = 0.0
+        state.fist_fired = False
+        return hud
 
-        want_back = state.swipe_vel_x < -CONFIG.SWIPE_ACCUM_PX
-        want_fwd = state.swipe_vel_x > CONFIG.SWIPE_ACCUM_PX
+    # Use the first visible hand (whichever is detected)
+    hs = hands[0]
+    px = hs.px
+    lm = hs.lm
+    fs = hs.fs
+    g  = hs.gesture
 
-        def _back() -> None:
-            pyautogui.hotkey("alt", "left")
-
-        def _fwd() -> None:
-            pyautogui.hotkey("alt", "right")
-
-        if pulse_action(state, "swipe_back", want_back, now, CONFIG.TAB_HOTKEY_COOLDOWN, _back):
-            hud.append("Swipe: Back")
-            state.add_event("Swipe BACK", now)
-            state.swipe_vel_x = 0.0
-        if pulse_action(state, "swipe_fwd", want_fwd, now, CONFIG.TAB_HOTKEY_COOLDOWN, _fwd):
-            hud.append("Swipe: Forward")
-            state.add_event("Swipe FORWARD", now)
-            state.swipe_vel_x = 0.0
+    # ── GESTURE 10: PAUSE / RESUME (Closed Fist) ────────────────────────────
+    if g == GestureId.FIST:
+        if not state.fist_fired:
+            state.system_paused = not state.system_paused
+            state.fist_fired = True
+            label = "PAUSED" if state.system_paused else "RESUMED"
+            state.add_event(label, now)
+            hud.append(label)
+            draw_neon_glow(frame, px[LM_WRIST], (0, 0, 180), 25)
+        return hud
     else:
-        state.prev_index_tip = None
-        state.swipe_vel_x *= CONFIG.SWIPE_DECAY
-        state.swipe_vel_y *= CONFIG.SWIPE_DECAY
+        state.fist_fired = False
 
-    for hs in hands:
-        label = hs.label
-        px = hs.px
-        lm = hs.lm
-        pinched = hs.d_thumb_index < CONFIG.PINCH_MAX_DIST
+    # Stop everything if paused
+    if state.system_paused:
+        draw_text_with_bg(frame, "  SYSTEM PAUSED  ", (10, 120),
+                          scale=0.9, color=(0, 0, 255), bg_color=(20, 20, 20))
+        return hud
 
-        if label == "Right":
-            if hs.gesture == GestureId.V_GEST and not pinched:
-                t8 = lm[LM_INDEX_TIP]
-                sx = int(t8.x * screen_w)
-                sy = int(t8.y * screen_h)
-                pyautogui.moveTo(sx, sy, duration=CONFIG.CURSOR_SMOOTH_DURATION)
-                cv2.circle(frame, px[LM_INDEX_TIP], 10, (255, 128, 0), 2)
-            elif hs.fs["index"] and hs.gesture != GestureId.FIST and not pinched:
-                t8 = lm[LM_INDEX_TIP]
-                sx = int(t8.x * screen_w)
-                sy = int(t8.y * screen_h)
-                pyautogui.moveTo(sx, sy, duration=CONFIG.CURSOR_SMOOTH_DURATION * 0.5)
-                cv2.circle(frame, px[LM_INDEX_TIP], 8, (255, 0, 0), -1)
+    # ── GESTURE 9: OPEN NEW TAB (All 5 fingers / Open Palm) ─────────────────
+    if g == GestureId.OPEN_PALM:
+        draw_neon_glow(frame, px[LM_WRIST], (0, 220, 255), 22)
+        if state.cooldown_ok("new_tab", now, CONFIG.NEW_TAB_COOLDOWN):
+            pyautogui.hotkey("ctrl", "t")
+            state.add_event("New Tab", now)
+            hud.append("NEW TAB")
+        state.prev_two_finger_mid = None
+        return hud
 
-        if label == "Left":
-            thumb = px[LM_THUMB_TIP]
-            index = px[LM_INDEX_TIP]
-            index2 = px[LM_INDEX_PIP]
-            pinky = px[LM_PINKY_TIP]
-            ds = dist_px(thumb, index)
-            dd = dist_px(thumb, index2)
-            dr = dist_px(thumb, pinky)
+    # ── GESTURE 8: VOLUME DOWN (4 fingers up, no thumb) ─────────────────────
+    if g == GestureId.FOUR_FINGERS:
+        draw_neon_glow(frame, px[LM_MIDDLE_TIP], (0, 100, 255), 18)
+        if state.cooldown_ok("vol_down", now, CONFIG.VOLUME_COOLDOWN):
+            pyautogui.press("volumedown")
+            state.add_event("Vol DOWN", now)
+            hud.append("VOL DOWN")
+        state.prev_two_finger_mid = None
+        return hud
 
-            if ds < CONFIG.CLICK_THRESHOLD:
+    # ── GESTURE 7: VOLUME UP (Index + Middle + Ring, 3 fingers) ─────────────
+    if g == GestureId.THREE_FINGERS:
+        draw_neon_glow(frame, px[LM_MIDDLE_TIP], (0, 255, 128), 18)
+        if state.cooldown_ok("vol_up", now, CONFIG.VOLUME_COOLDOWN):
+            pyautogui.press("volumeup")
+            state.add_event("Vol UP", now)
+            hud.append("VOL UP")
+        state.prev_two_finger_mid = None
+        return hud
 
-                def _lc() -> None:
-                    pyautogui.click()
+    # ── GESTURE 5 & 6: SCROLL UP/DOWN + SWITCH TABS (Index + Middle) ────────
+    if g == GestureId.TWO_FINGERS:
+        draw_green_pair(frame, px[LM_INDEX_TIP], px[LM_MIDDLE_TIP])
+        mid = hs.midpoint_im
+        prev = state.prev_two_finger_mid
+        state.prev_two_finger_mid = mid
 
-                if pulse_action(state, "left_click", True, now, CONFIG.GESTURE_COOLDOWN, _lc):
-                    hud.append("Left: Click")
-                    state.add_event("Left CLICK", now)
-            else:
-                _held_reset(state, "left_click")
+        if prev is not None:
+            dy = mid[1] - prev[1]   # positive = moving down
+            dx = mid[0] - prev[0]   # positive = moving right
 
-            if dd < CONFIG.CLICK_THRESHOLD:
+            # Prioritise whichever axis is dominant
+            if abs(dy) > abs(dx):   # ── Vertical → Scroll
+                state.tab_swipe_acc = 0.0
+                if dy < -CONFIG.SCROLL_DELTA_Y and state.cooldown_ok("scroll_up", now, CONFIG.SCROLL_COOLDOWN):
+                    pyautogui.scroll(3)
+                    state.add_event("Scroll UP", now)
+                    hud.append("SCROLL UP")
+                    draw_neon_glow(frame, mid, (0, 0, 255), 14)
+                elif dy > CONFIG.SCROLL_DELTA_Y and state.cooldown_ok("scroll_dn", now, CONFIG.SCROLL_COOLDOWN):
+                    pyautogui.scroll(-3)
+                    state.add_event("Scroll DOWN", now)
+                    hud.append("SCROLL DOWN")
+                    draw_neon_glow(frame, mid, (255, 80, 0), 14)
+            else:                   # ── Horizontal → Switch Tab
+                state.tab_swipe_acc += dx
+                if state.tab_swipe_acc > CONFIG.SWITCH_TAB_ACCUM:
+                    if state.cooldown_ok("tab_next", now, CONFIG.TAB_COOLDOWN):
+                        pyautogui.hotkey("ctrl", "tab")
+                        state.add_event("Next Tab", now)
+                        hud.append("NEXT TAB →")
+                    state.tab_swipe_acc = 0.0
+                elif state.tab_swipe_acc < -CONFIG.SWITCH_TAB_ACCUM:
+                    if state.cooldown_ok("tab_prev", now, CONFIG.TAB_COOLDOWN):
+                        pyautogui.hotkey("ctrl", "shift", "tab")
+                        state.add_event("Prev Tab", now)
+                        hud.append("PREV TAB ←")
+                    state.tab_swipe_acc = 0.0
+        return hud
+    else:
+        state.prev_two_finger_mid = None
+        state.tab_swipe_acc = 0.0
 
-                def _dc() -> None:
-                    pyautogui.doubleClick()
+    # ── GESTURE 1: CURSOR MOVE (Index finger only) ───────────────────────────
+    if g == GestureId.INDEX_ONLY:
+        # Check touches FIRST before moving cursor
 
-                if pulse_action(state, "dbl_click", True, now, CONFIG.GESTURE_COOLDOWN, _dc):
-                    hud.append("Left: Double")
-                    state.add_event("Left DOUBLE", now)
-            else:
-                _held_reset(state, "dbl_click")
+        # GESTURE 2: LEFT CLICK — Index + Thumb touch
+        if hs.d_thumb_index < CONFIG.INDEX_THUMB_TOUCH:
+            draw_green_pair(frame, px[LM_THUMB_TIP], px[LM_INDEX_TIP])
+            if state.cooldown_ok("left_click", now, CONFIG.CLICK_COOLDOWN):
+                pyautogui.click()
+                state.add_event("Left Click", now)
+                hud.append("LEFT CLICK")
+                draw_neon_glow(frame, px[LM_INDEX_TIP], (0, 255, 0), 20)
+            return hud
 
-            if dr < CONFIG.CLICK_THRESHOLD:
+        # Pure cursor movement
+        t8 = lm[LM_INDEX_TIP]
+        sx = int(t8.x * screen_w)
+        sy = int(t8.y * screen_h)
+        pyautogui.moveTo(sx, sy, duration=CONFIG.CURSOR_SMOOTH_DURATION)
+        cv2.circle(frame, px[LM_INDEX_TIP], 10, (255, 200, 0), -1)
+        return hud
 
-                def _rc() -> None:
-                    pyautogui.rightClick()
-
-                if pulse_action(state, "right_click", True, now, CONFIG.GESTURE_COOLDOWN, _rc):
-                    hud.append("Left: Right")
-                    state.add_event("Left RIGHT-CLK", now)
-            else:
-                _held_reset(state, "right_click")
+    # ── GESTURE 3: RIGHT CLICK — Middle + Thumb touch (any other pose) ──────
+    if hs.d_thumb_middle < CONFIG.MIDDLE_THUMB_TOUCH:
+        draw_green_pair(frame, px[LM_THUMB_TIP], px[LM_MIDDLE_TIP])
+        if state.cooldown_ok("right_click", now, CONFIG.CLICK_COOLDOWN):
+            pyautogui.rightClick()
+            state.add_event("Right Click", now)
+            hud.append("RIGHT CLICK")
+            draw_neon_glow(frame, px[LM_MIDDLE_TIP], (0, 255, 255), 20)
+        return hud
 
     return hud
+
+
+
 
 
 HAND_CONNECTIONS = mp_hand_landmarker.HandLandmarksConnections.HAND_CONNECTIONS
