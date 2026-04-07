@@ -624,9 +624,11 @@ def _frames_are_valid(
     return False
 
 
-def _find_working_camera() -> cv2.VideoCapture | None:
+def _find_working_camera() -> tuple[cv2.VideoCapture, int, int] | None:
     """Iterate camera indices × backends and return the first combination
     that actually delivers non-blank frames.
+
+    Returns ``(cap, cam_index, backend)`` or ``None``.
 
     On Windows, cameras sometimes report ``isOpened() == True`` with a
     certain backend but only deliver black frames.  This function
@@ -652,12 +654,33 @@ def _find_working_camera() -> cv2.VideoCapture | None:
                     f"backend {name}",
                     flush=True,
                 )
-                return cap
+                return cap, cam_index, backend
 
             print(f"[camera]   opened but frames are blank – skipping.", flush=True)
             cap.release()
 
     return None
+
+
+def _open_camera_with_resolution(
+    cam_index: int,
+    backend: int,
+    width: int = 1280,
+    height: int = 720,
+    fps: int = 30,
+) -> cv2.VideoCapture:
+    """Open a fresh VideoCapture at the desired resolution.
+
+    Changing resolution properties on an already-open capture can corrupt
+    the internal buffer stride on some Windows MSMF drivers, causing
+    ``cv2.error: (-215:Assertion failed) _step >= minstep``.
+    Reopening avoids this entirely.
+    """
+    cap = cv2.VideoCapture(cam_index, backend)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS,          fps)
+    return cap
 
 
 def main() -> None:
@@ -666,9 +689,9 @@ def main() -> None:
     screen_w, screen_h = pyautogui.size()
 
     # ── Open the camera with robust fallback logic ─────────────────────────
-    cap = _find_working_camera()
+    result = _find_working_camera()
 
-    if cap is None:
+    if result is None:
         print(
             "\n[ERROR] Could not get frames from any camera.\n"
             "  Troubleshooting steps:\n"
@@ -681,10 +704,18 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Request preferred resolution / FPS (camera will use closest supported)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
-    cap.set(cv2.CAP_PROP_FPS,           30)
+    probe_cap, cam_index, backend = result
+    # Release the probe capture and reopen with the desired resolution.
+    # Changing resolution on an already-open capture can corrupt the
+    # internal buffer stride on Windows MSMF drivers, causing:
+    #   cv2.error: (-215:Assertion failed) _step >= minstep
+    probe_cap.release()
+    cap = _open_camera_with_resolution(cam_index, backend, 1280, 720, 30)
+
+    if not cap.isOpened():
+        print("[camera] Failed to reopen camera at target resolution; "
+              "falling back to probe capture.", flush=True)
+        cap = cv2.VideoCapture(cam_index, backend)
 
     # Verify what the camera actually accepted
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -708,6 +739,8 @@ def main() -> None:
 
     frame_ts_ms   = 0
     control_state = ControlState()
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 50  # reopen camera after this many failures
 
     # ── Create window — always on top so gestures never close it ────────────
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
@@ -716,12 +749,29 @@ def main() -> None:
 
     with mp_hand_landmarker.HandLandmarker.create_from_options(hand_options) as landmarker:
         while cap.isOpened():
-            ok, frame = cap.read()
+            # Wrap cap.read() in try/except to handle OpenCV assertion
+            # errors that some camera drivers can raise mid-stream.
+            try:
+                ok, frame = cap.read()
+            except cv2.error as e:
+                print(f"[camera] cv2.error during read: {e}", flush=True)
+                ok, frame = False, None
+
             if not ok or frame is None:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    print("[camera] Too many consecutive read failures; "
+                          "attempting to reopen camera …", flush=True)
+                    cap.release()
+                    cap = _open_camera_with_resolution(
+                        cam_index, backend, 1280, 720, 30
+                    )
+                    consecutive_failures = 0
                 # Brief sleep to avoid busy-looping if the camera stalls
                 time.sleep(0.01)
                 continue
 
+            consecutive_failures = 0
             frame      = cv2.flip(frame, 1)
             fh, fw     = frame.shape[:2]
             now        = time.monotonic()
