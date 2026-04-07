@@ -213,8 +213,3 @@ MIT License — see [LICENSE](LICENSE).
 
 ---
 
-## 🙏 Acknowledgements
-
-- Original project: [HaticeSude/hand-gesture-virtual-mouse](https://github.com/HaticeSude/hand-gesture-virtual-mouse)
-- [Google MediaPipe](https://developers.google.com/mediapipe) for the HandLandmarker model
-- Built and extended with ❤️ using [Antigravity AI](https://antigravity.dev)
